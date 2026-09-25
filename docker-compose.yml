@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: lab-pool-traceability-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/lab.db
+    volumes:
+      - lab-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  lab-data:
