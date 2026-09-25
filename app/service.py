@@ -201,3 +201,90 @@ def pool_plan(
     for sid, frac in comp_b.items():
         composition[sid] = composition.get(sid, Fraction(0)) + share_b * frac
     return portions_a, portions_b, composition
+
+
+def portion_diagnosis(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    measured: dict[int, Fraction],
+    max_portions: int,
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int]]]:
+    """假设混样 batch_id 的配方中仅一项投入份数记错，反推该项的正整数份数。
+
+    measured 为 {原始样本 id: 实测占比}（未列出的样本视为 0，总和已为 1，
+    由调用方校验）。设被记错的项为 j（记录份数 p_j，实际份数 x），其余项
+    份数之和 R 与其贡献 B_s 固定，则实际组成为 (B_s + x·A_s)/(R + x)，
+    其中 A_s 为 j 沿嵌套配方精确展开的样本 s 占比。对每个样本得到有理数
+    方程 x·(A_s − m_s) = m_s·R − B_s，任取 A_s ≠ m_s 的样本即可解出唯一
+    候选 x，再用全部样本占比逐一复核。
+
+    返回 (solutions, undetermined)，均按原料 id 升序：
+    - solutions: [(原料批次 id, 原份数, 纠正份数)]，只含与原值不同且不超过
+      max_portions 的解；
+    - undetermined: [(原料批次 id, 原份数)]，份数变化不改变组成（B_s = A_s·R）
+      且组成恰与实测吻合（A_s = m_s）的项——任意正整数份数都成立，无法判定，
+      不枚举份数。
+    不写库。
+    """
+    kinds, recipes = _load_graph(conn)
+    recipe = recipes.get(batch_id, [])
+    memo: dict[int, Composition] = {}
+    comps = {ingredient_id: _expand(kinds, recipes, ingredient_id, memo)
+             for ingredient_id, _ in recipe}
+
+    total = sum(portions for _, portions in recipe)
+    # 全部相关样本：实测列出的 ∪ 任一原料展开含有的（未列出的实测占比视为 0）
+    all_samples = set(measured)
+    for comp in comps.values():
+        all_samples.update(comp)
+
+    # 当前配方下各样本的未归一化分子 N_s = Σ_i p_i·comp_i(s)，
+    # 去掉项 j 后即其余项的贡献 B_s = N_s − p_j·A_s
+    numerator_sum = {
+        s: sum((portions * comps[i].get(s, Fraction(0)) for i, portions in recipe),
+               Fraction(0))
+        for s in all_samples
+    }
+
+    solutions: list[tuple[int, int, int]] = []
+    undetermined: list[tuple[int, int]] = []
+    for ingredient_id, original in sorted(recipe):
+        rest = total - original  # R：其余项份数之和
+        comp_j = comps[ingredient_id]
+
+        def others_contrib(s: int) -> Fraction:
+            return numerator_sum[s] - original * comp_j.get(s, Fraction(0))
+
+        # 份数变化不改变组成且与实测吻合：任意正整数份数都成立，无法判定
+        if all(
+            comp_j.get(s, Fraction(0)) == measured.get(s, Fraction(0))
+            and others_contrib(s) == measured.get(s, Fraction(0)) * rest
+            for s in all_samples
+        ):
+            undetermined.append((ingredient_id, original))
+            continue
+
+        # 任取一个 A_s ≠ m_s 的样本解出唯一候选 x；若不存在这样的样本
+        # （A_s 恒等于 m_s 但某项 B_s ≠ m_s·R），则任何 x 都不满足，无解
+        candidate: Fraction | None = None
+        for s in all_samples:
+            a_s = comp_j.get(s, Fraction(0))
+            m_s = measured.get(s, Fraction(0))
+            if a_s != m_s:
+                candidate = (m_s * rest - others_contrib(s)) / (a_s - m_s)
+                break
+        if candidate is None or candidate.denominator != 1 or candidate < 1:
+            continue
+        corrected = candidate.numerator
+        # 只保留不同于原值且不超过上限的解
+        if corrected == original or corrected > max_portions:
+            continue
+        # 用全部样本占比复核（未列出的样本实测占比视为 0）
+        if all(
+            (others_contrib(s) + corrected * comp_j.get(s, Fraction(0)))
+            / (rest + corrected)
+            == measured.get(s, Fraction(0))
+            for s in all_samples
+        ):
+            solutions.append((ingredient_id, original, corrected))
+    return solutions, undetermined
