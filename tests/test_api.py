@@ -771,3 +771,288 @@ def test_concurrent_rule_registration_and_pool_creation(client):
     if first_reject is not None:
         assert all(c == 409 for c in pool_codes[first_reject:])
 
+
+# --------------------------------------------------------------------------- #
+# POST /batches/{id}/portion-diagnosis
+# --------------------------------------------------------------------------- #
+
+
+def diagnose(client, batch_id, measurements, max_portions):
+    return client.post(
+        f"/batches/{batch_id}/portion-diagnosis",
+        json={"measurements": measurements, "max_portions": max_portions},
+    )
+
+
+def m(sample_id, numerator, denominator):
+    return {"sample_id": sample_id, "numerator": numerator, "denominator": denominator}
+
+
+def test_portion_diagnosis_finds_single_wrong_item(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    # 登记配方 2×S1 + 1×S2，实际应为 3×S1 + 1×S2（S1 占 3/4）
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2},
+        {"batch_id": s2, "portions": 1},
+    ])
+    r = diagnose(client, p1, [m(s1, 3, 4), m(s2, 1, 4)], 10)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["batch_id"] == p1
+    assert body["batch_name"] == "P1"
+    assert body["solutions"] == [
+        {"batch_id": s1, "batch_name": "S1", "portions": 3}
+    ]
+    assert body["undeterminable"] == []
+
+
+def test_portion_diagnosis_expands_nested_recipes(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 登记配方 1×P1 + 1×S1，实际应为 2×P1 + 1×S1（S1 占 2/3、S2 占 1/3）
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1},
+        {"batch_id": s1, "portions": 1},
+    ])
+    r = diagnose(client, p2, [m(s1, 2, 3), m(s2, 1, 3)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == [
+        {"batch_id": p1, "batch_name": "P1", "portions": 2}
+    ]
+    assert r.json()["undeterminable"] == []
+
+
+def test_portion_diagnosis_three_ingredient_pool(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 登记 1×S1 + 1×S2 + 1×S3，实际应为 1×S1 + 1×S2 + 3×S3
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+        {"batch_id": s3, "portions": 1},
+    ])
+    r = diagnose(client, p1, [m(s1, 1, 5), m(s2, 1, 5), m(s3, 3, 5)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == [
+        {"batch_id": s3, "batch_name": "S3", "portions": 3}
+    ]
+
+
+def test_portion_diagnosis_multiple_solutions_sorted_by_ingredient_id(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    # 登记 2×S1 + 3×S2；实测 1/2 + 1/2 既可由 3×S1 + 3×S2 也可由 2×S1 + 2×S2 得到
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2},
+        {"batch_id": s2, "portions": 3},
+    ])
+    r = diagnose(client, p1, [m(s1, 1, 2), m(s2, 1, 2)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == [
+        {"batch_id": s1, "batch_name": "S1", "portions": 3},
+        {"batch_id": s2, "batch_name": "S2", "portions": 2},
+    ]
+
+
+def test_portion_diagnosis_undeterminable_when_portions_do_not_change_composition(client):
+    s1 = make_sample(client, "S1")
+    # Q 只含 S1，与 S1 本身组成完全相同：P 中 S1 与 Q 的份数如何变化都不改变组成
+    q = make_pool(client, "Q", [{"batch_id": s1, "portions": 1}])
+    p = make_pool(client, "P", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": q, "portions": 1},
+    ])
+    r = diagnose(client, p, [m(s1, 1, 1)], 10)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["solutions"] == []
+    # 两项都无法判定，按原料 id 升序，不枚举份数
+    assert body["undeterminable"] == [
+        {"batch_id": s1, "batch_name": "S1"},
+        {"batch_id": q, "batch_name": "Q"},
+    ]
+
+
+def test_portion_diagnosis_no_solution_returns_empty_lists(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 3/5 + 2/5 无法由改动任一项的正整数份数达到（候选份数 3/2、2/3 均非整数）
+    r = diagnose(client, p1, [m(s1, 3, 5), m(s2, 2, 5)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == []
+    assert r.json()["undeterminable"] == []
+
+
+def test_portion_diagnosis_original_value_is_not_a_solution(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 实测与登记配方一致：每项反推的份数都等于原值，不作为解返回
+    r = diagnose(client, p1, [m(s1, 2, 3), m(s2, 1, 3)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == []
+    assert r.json()["undeterminable"] == []
+
+
+def test_portion_diagnosis_respects_max_portions(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 实测 S1 占 5/6 → S1 应为 5 份；恰好等于上限时接受，低于上限时无解
+    r = diagnose(client, p1, [m(s1, 5, 6), m(s2, 1, 6)], 5)
+    assert r.json()["solutions"] == [
+        {"batch_id": s1, "batch_name": "S1", "portions": 5}
+    ]
+    r = diagnose(client, p1, [m(s1, 5, 6), m(s2, 1, 6)], 4)
+    assert r.json()["solutions"] == []
+    assert r.json()["undeterminable"] == []
+
+
+def test_portion_diagnosis_unlisted_sample_counts_as_zero(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 只列 S1=1/1：未列的 S2 视为 0，改动任一项份数都无法让 S2 占比归零 → 无解
+    r = diagnose(client, p1, [m(s1, 1, 1)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == []
+    assert r.json()["undeterminable"] == []
+
+
+def test_portion_diagnosis_explicit_zero_for_uninvolved_sample(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")  # 存在但不参与混样
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 显式列出未参与样本的 0 占比不影响诊断
+    r = diagnose(client, p1, [m(s1, 2, 3), m(s2, 1, 3), m(s3, 0, 1)], 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == [
+        {"batch_id": s1, "batch_name": "S1", "portions": 2}
+    ]
+
+
+def test_portion_diagnosis_does_not_modify_database(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2},
+        {"batch_id": s2, "portions": 1},
+    ])
+    before_list = client.get("/batches").json()
+    before_detail = client.get(f"/batches/{p1}").json()
+    before_comp = fractions_of(client, p1)
+
+    r = diagnose(client, p1, [m(s1, 3, 4), m(s2, 1, 4)], 10)
+    assert r.status_code == 200, r.text
+
+    assert client.get("/batches").json() == before_list
+    assert client.get(f"/batches/{p1}").json() == before_detail
+    assert fractions_of(client, p1) == before_comp
+
+
+def test_portion_diagnosis_unknown_target_returns_404(client):
+    assert diagnose(client, 4242, [m(1, 1, 1)], 10).status_code == 404
+
+
+def test_portion_diagnosis_sample_target_rejected(client):
+    s1 = make_sample(client, "S1")
+    r = diagnose(client, s1, [m(s1, 1, 1)], 10)
+    assert r.status_code == 400
+
+
+def test_portion_diagnosis_unknown_or_pool_measured_sample_rejected(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 未知批次 id → 400
+    r = diagnose(client, p1, [m(s1, 1, 2), m(999, 1, 2)], 10)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+    # 实测对象不是原始样本 → 400
+    r = diagnose(client, p1, [m(s1, 1, 2), m(p1, 1, 2)], 10)
+    assert r.status_code == 400
+    assert "原始样本" in r.json()["detail"]
+
+
+def test_portion_diagnosis_duplicate_sample_id_rejected(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    r = diagnose(client, p1, [m(s1, 1, 4), m(s1, 3, 4)], 10)
+    assert r.status_code == 422
+
+
+def test_portion_diagnosis_proportions_must_sum_to_one(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    # 之和不为 1 → 422（含空列表：之和为 0）
+    assert diagnose(client, p1, [m(s1, 1, 2)], 10).status_code == 422
+    assert diagnose(client, p1, [m(s1, 1, 2), m(s2, 1, 2), m(s1 + s2 + 100, 1, 2)], 10).status_code == 422
+    assert diagnose(client, p1, [], 10).status_code == 422
+    # 未约分但之和为 1 的合法请求正常受理
+    assert diagnose(client, p1, [m(s1, 2, 4), m(s2, 1, 2)], 10).status_code == 200
+
+
+@pytest.mark.parametrize("numerator,denominator", [
+    (-1, 2),    # 负分子
+    (1, 0),     # 分母为 0
+    (1, -2),    # 负分母
+    (1.5, 2),   # 小数
+    ("1", 2),   # 字符串
+    (True, 2),  # 布尔
+])
+def test_portion_diagnosis_invalid_fraction_rejected(client, numerator, denominator):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    r = diagnose(client, p1, [m(s1, numerator, denominator), m(s2, 1, 2)], 10)
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("cap", [0, -1, 1.5, 2.0, "3", True])
+def test_portion_diagnosis_invalid_max_portions_rejected(client, cap):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+    ])
+    r = diagnose(client, p1, [m(s1, 1, 2), m(s2, 1, 2)], cap)
+    assert r.status_code == 422
+

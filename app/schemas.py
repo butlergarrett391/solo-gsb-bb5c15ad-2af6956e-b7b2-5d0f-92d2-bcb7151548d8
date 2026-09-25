@@ -1,6 +1,7 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -133,3 +134,52 @@ class PoolPlanOut(BaseModel):
     total_portions: int  # 最小总份数 = recipe 中份数之和，且 ≤ max_total_portions
     recipe: list[PoolPlanRecipeItemOut]  # 顺序与请求中两个原料一致，可直接提交 /pools
     components: list[ComponentOut]  # 新混样的全部原始样本占比（约分后的分子/分母）
+
+
+class MeasuredProportion(BaseModel):
+    """一项实测原始样本占比；未列出的样本占比视为 0。"""
+
+    sample_id: StrictPositiveInt
+    numerator: StrictNonNegativeInt  # 分数非负
+    denominator: StrictPositiveInt  # 分母为正
+
+
+class PortionDiagnosisRequest(BaseModel):
+    """份数误差诊断：实测原始样本占比列表 + 修正份数的上限。"""
+
+    measurements: list[MeasuredProportion]
+    max_portions: StrictPositiveInt
+
+    @model_validator(mode="after")
+    def _validate(self) -> PortionDiagnosisRequest:
+        seen: set[int] = set()
+        for item in self.measurements:
+            if item.sample_id in seen:
+                raise ValueError(f"实测样本 id 不得重复: {item.sample_id}")
+            seen.add(item.sample_id)
+        total = sum(
+            (Fraction(item.numerator, item.denominator) for item in self.measurements),
+            Fraction(0),
+        )
+        if total != 1:
+            raise ValueError("实测占比之和必须等于 1")
+        return self
+
+
+class PortionDiagnosisSolutionOut(BaseModel):
+    batch_id: int
+    batch_name: str
+    portions: int  # 反推出的正确份数：正整数、≠ 原值、≤ max_portions
+
+
+class PortionDiagnosisUndeterminableOut(BaseModel):
+    batch_id: int
+    batch_name: str
+    # 份数变化不改变组成且与实测吻合：无法判定，不枚举份数
+
+
+class PortionDiagnosisOut(BaseModel):
+    batch_id: int
+    batch_name: BatchName
+    solutions: list[PortionDiagnosisSolutionOut]  # 按原料批次 id 升序，无解为空
+    undeterminable: list[PortionDiagnosisUndeterminableOut]  # 按原料批次 id 升序

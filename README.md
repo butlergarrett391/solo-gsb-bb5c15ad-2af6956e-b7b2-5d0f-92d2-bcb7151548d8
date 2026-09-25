@@ -11,6 +11,7 @@
 - 占比追溯：按每层“投入份数 / 该层总份数”递归分摊；同一原始样本经多条路径到达时**自动合并**；基于 `fractions.Fraction` 精确有理数运算，返回**约分后**的分子与分母
 - **目标占比规划**：给定两个不同的已有批次、一个原始样本与目标占比，反算使新混样精确达标的**正整数投入份数**，只返回总份数最小的整数解（两原料占比都等于目标时取 1:1），配方可直接提交 `/pools`；**只规划、不创建批次**
 - **配方变更影响预演**：提交完整替代配方，在内存中演算目标批次及全部下游批次各原始样本的原占比、预演占比与有符号差值，**不修改数据库**
+- **配方份数误差诊断**：假设混样配方**仅一项投入份数记错**，提交实测原始样本占比与份数上限，沿嵌套配方精确展开各原料，用有理数方程反推该项的正整数份数并以全部样本占比复核；份数变化不改变组成的项列为**无法判定**；**不修改数据库**
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -54,6 +55,7 @@ docker compose up --build
 | `GET` | `/batches/{id}` | 批次详情（混样含配方） |
 | `GET` | `/batches/{id}/composition` | 递归追溯原始样本占比 |
 | `POST` | `/batches/{id}/recipe-preview` | 配方变更影响预演（不写库） |
+| `POST` | `/batches/{id}/portion-diagnosis` | 配方份数误差诊断（不写库） |
 
 ## 示例请求
 
@@ -270,6 +272,61 @@ curl -X POST http://localhost:8000/pools \
 - `/pool-plans` 只做配方规划、不创建批次，`/batches/{id}/recipe-preview` 只做内存预演，二者均不做禁配检查；
 - 规则登记与混样创建使用同一个 SQLite 写事务模型（`BEGIN IMMEDIATE` 立即获取写锁），两类写操作相互串行：并发登记的规则一旦提交，随后的混样创建必然能读到该规则，不会漏检。
 
+### 8. 配方份数误差诊断
+
+`POST /batches/{id}/portion-diagnosis` 用于排查“配方中仅一项投入份数记错”的场景：对目标**混样批次**提交**实测原始样本占比列表**与修正份数上限 `max_portions`，接口假设现有配方中**恰好一项**份数有误、其余各项不变，沿嵌套配方精确展开各原料，用有理数方程反推该项的正整数份数，并以全部样本占比复核。接口只在内存中计算，**不修改数据库**。
+
+请求格式：
+
+- `measurements`：实测占比列表，每项为 `sample_id` + `numerator` / `denominator`。样本 id **不得重复**且必须已登记为**原始样本**（否则 400）；分子非负、分母为正（否则 422）；全部占比之和必须**恰好等于 1**（否则 422）；**未列出的样本占比视为 0**；
+- `max_portions`：修正后份数的上限（严格正整数）。
+
+返回：
+
+- `solutions`：全部满足条件的修正方案（原料批次 id、名称与反推出的正整数份数），只包含**不同于原值且不超过上限**的解，按原料批次 id 升序；无解时为空列表；
+- `undeterminable`：若改变某项份数**不会改变批次组成**（该原料与其余部分的组成完全一致）且与实测吻合，则该项份数**无法判定**——只列出原料、不枚举份数，同样按原料批次 id 升序。
+
+服务默认运行在 `http://localhost:8000`（见上文“快速开始”）。以第 2 节的 S1、S2 为例：P1 登记配方为 `2×S1 + 1×S2`（S1 应占 2/3），实测 S1 占 3/4、S2 占 1/4——即实际是 `3×S1 + 1×S2`，S1 的份数被记错：
+
+```bash
+curl -X POST http://localhost:8000/batches/3/portion-diagnosis \
+  -H 'Content-Type: application/json' \
+  -d '{"measurements": [{"sample_id": 1, "numerator": 3, "denominator": 4}, {"sample_id": 2, "numerator": 1, "denominator": 4}], "max_portions": 10}'
+```
+
+```json
+{
+  "batch_id": 3,
+  "batch_name": "P1",
+  "solutions": [
+    {"batch_id": 1, "batch_name": "S1", "portions": 3}
+  ],
+  "undeterminable": []
+}
+```
+
+校验：把 S1 的份数改为 3 后组成变为 `3×S1 + 1×S2`，S1 = 3/4、S2 = 1/4，与实测完全吻合；而改动 S2 的份数不存在满足条件的正整数解，故不在结果中。
+
+**无法判定示例**：若批次 `P = 1×S1 + 1×Q`，其中混样 Q 只含 S1（组成与 S1 完全相同），则无论 S1 与 Q 各占多少份，P 的组成恒为 100% S1。实测 `S1 = 1/1` 时两项都列为无法判定：
+
+```json
+{
+  "batch_id": 5,
+  "batch_name": "P",
+  "solutions": [],
+  "undeterminable": [
+    {"batch_id": 1, "batch_name": "S1"},
+    {"batch_id": 4, "batch_name": "Q"}
+  ]
+}
+```
+
+说明：
+
+- 诊断基于“**仅一项**份数记错”的假设：同一请求可能返回多个原料的各自修正方案（彼此独立成立），也可能无解（空列表）；
+- 实测与登记配方完全一致时，各项反推出的份数都等于原值，不作为解返回（结果为空）；
+- 目标批次不存在返回 **404**；目标是原始样本（无配方）返回 **400**；实测样本 id 未知或指向混样批次返回 **400**；占比格式与求和校验失败、`max_portions` 非正整数等返回 **422**。
+
 ### 错误示例
 
 ```bash
@@ -313,6 +370,20 @@ curl -X POST http://localhost:8000/exclusion-rules -H 'Content-Type: application
 curl -X POST http://localhost:8000/pools -H 'Content-Type: application/json' \
   -d '{"name": "PBAD", "recipe": [{"batch_id": 1, "portions": 1}, {"batch_id": 2, "portions": 1}]}'
 # {"detail":{"message":"混样命中原始样本禁配规则","pair":[{"sample_id":1,"sample_name":"S1"},{"sample_id":2,"sample_name":"S2"}]}}
+
+# 份数诊断：实测占比之和不为 1 → 422
+curl -X POST http://localhost:8000/batches/3/portion-diagnosis -H 'Content-Type: application/json' \
+  -d '{"measurements": [{"sample_id": 1, "numerator": 1, "denominator": 2}], "max_portions": 10}'
+
+# 份数诊断：实测样本 id 重复 → 422
+curl -X POST http://localhost:8000/batches/3/portion-diagnosis -H 'Content-Type: application/json' \
+  -d '{"measurements": [{"sample_id": 1, "numerator": 1, "denominator": 4}, {"sample_id": 1, "numerator": 3, "denominator": 4}], "max_portions": 10}'
+
+# 份数诊断：实测对象不是原始样本 / 目标是原始样本 → 400
+curl -X POST http://localhost:8000/batches/3/portion-diagnosis -H 'Content-Type: application/json' \
+  -d '{"measurements": [{"sample_id": 3, "numerator": 1, "denominator": 1}], "max_portions": 10}'
+curl -X POST http://localhost:8000/batches/1/portion-diagnosis -H 'Content-Type: application/json' \
+  -d '{"measurements": [{"sample_id": 1, "numerator": 1, "denominator": 1}], "max_portions": 10}'
 ```
 
 ## 占比计算说明
@@ -336,12 +407,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（含禁配规则登记/查询、目标占比规划、配方变更预演端点）
+  main.py       # FastAPI 路由与请求处理（含禁配规则登记/查询、目标占比规划、配方变更预演、份数误差诊断端点）
   db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则表与写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算、配方图可达原始样本、目标占比反算与配方预演（Fraction 精确分数）
+  service.py    # 递归占比计算、配方图可达原始样本、目标占比反算、配方预演与份数误差诊断（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、禁配规则、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数误差诊断、禁配规则、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

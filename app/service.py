@@ -201,3 +201,97 @@ def pool_plan(
     for sid, frac in comp_b.items():
         composition[sid] = composition.get(sid, Fraction(0)) + share_b * frac
     return portions_a, portions_b, composition
+
+
+def portion_diagnosis(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    measured: dict[int, Fraction],
+    max_portions: int,
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """假设混样 batch_id 的配方仅一项投入份数记错，反推该项的正整数份数。
+
+    measured 为实测原始样本占比（未列样本视为 0）。对配方中每一项 k（原记份数
+    p_k），设其余项份数不变、k 的真实份数为 x，沿嵌套配方精确展开后，每个原始
+    样本 s 须满足有理数方程
+
+        (A(s) + x·B(s)) / (T' + x) = m(s)
+
+    其中 B 为原料 k 的展开占比，A(s) 为其余各项的份数加权占比之和，T' 为其余项
+    份数之和，m(s) 为实测占比。这是关于 x 的一次方程：
+
+    - 若某样本使 m(s) ≠ B(s)，x 被唯一确定为 (A(s) − m(s)·T') / (m(s) − B(s))；
+      候选 x 还须是不超过 max_portions 的正整数、不同于原值 p_k，并以全部样本
+      占比复核通过才计为一个解；
+    - 若全部样本都有 m(s) == B(s)，方程退化为 A(s) == m(s)·T'（与 x 无关）：
+      成立时 k 的份数如何变化都不改变组成且与实测吻合，列为无法判定（不枚举
+      份数）；不成立则该项无解。
+
+    返回 (解列表 [(原料批次 id, 正确份数)], 无法判定的原料批次 id 列表)，两者均
+    按原料批次 id 升序；无任何解时两个列表都为空。只在内存中计算，不写库。
+    """
+    kinds, recipes = _load_graph(conn)
+    # pool_recipes 主键 (pool_id, ingredient_id) 保证同一原料只出现一次
+    items = sorted(recipes[batch_id])
+    total = sum(portions for _, portions in items)
+
+    # 沿嵌套配方精确展开各原料；memo 让多路径汇合的批次只展开一次
+    memo: dict[int, Composition] = {}
+    expanded = {
+        ingredient_id: _expand(kinds, recipes, ingredient_id, memo)
+        for ingredient_id, _ in items
+    }
+
+    # 复核覆盖全部相关样本：实测样本 ∪ 各原料展开涉及的样本（未列样本实测为 0）
+    all_samples = set(measured)
+    for comp in expanded.values():
+        all_samples.update(comp)
+
+    # weighted[s] = Σ_i p_i·comp_i(s)：全部配方项的份数加权占比之和
+    weighted: dict[int, Fraction] = {}
+    for ingredient_id, portions in items:
+        for sample_id, frac in expanded[ingredient_id].items():
+            weighted[sample_id] = weighted.get(sample_id, Fraction(0)) + portions * frac
+
+    solutions: list[tuple[int, int]] = []
+    undeterminable: list[int] = []
+    for ingredient_id, original in items:
+        rest_total = total - original
+        comp_k = expanded[ingredient_id]
+        # m(s)：实测占比（未列样本为 0）；B(s)：原料 k 的展开占比；
+        # A(s)：其余项的份数加权占比 = weighted[s] − p_k·B(s)
+        m_of = {s: measured.get(s, Fraction(0)) for s in all_samples}
+        b_of = {s: comp_k.get(s, Fraction(0)) for s in all_samples}
+        a_of = {s: weighted.get(s, Fraction(0)) - original * b_of[s] for s in all_samples}
+
+        # 若存在 m(s) ≠ B(s) 的样本，x 被它唯一确定；任取一个即可，
+        # 不同样本给出不一致的 x 时会在下面的全样本复核中被排除
+        candidate: Fraction | None = None
+        for s in sorted(all_samples):
+            if m_of[s] != b_of[s]:
+                candidate = (a_of[s] - m_of[s] * rest_total) / (m_of[s] - b_of[s])
+                break
+
+        if candidate is None:
+            # 全部样本 m(s) == B(s)：等式退化为 A(s) == m(s)·T'，与 x 无关。
+            # 成立则该项份数如何变化都不改变组成且与实测吻合 → 无法判定
+            if all(a_of[s] == m_of[s] * rest_total for s in all_samples):
+                undeterminable.append(ingredient_id)
+            continue
+
+        # 只接受不同于原值且不超过上限的正整数份数
+        if (
+            candidate.denominator != 1
+            or candidate <= 0
+            or candidate > max_portions
+            or candidate == original
+        ):
+            continue
+        portions = candidate.numerator
+        # 以全部样本占比复核（未列样本实测值视为 0）
+        if all(
+            m_of[s] * (rest_total + portions) == a_of[s] + portions * b_of[s]
+            for s in all_samples
+        ):
+            solutions.append((ingredient_id, portions))
+    return solutions, undeterminable

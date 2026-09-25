@@ -9,6 +9,7 @@
 - GET  /batches/{batch_id}             批次详情（混样含配方）
 - GET  /batches/{batch_id}/composition 递归计算原始样本占比（约分后的分子/分母）
 - POST /batches/{batch_id}/recipe-preview 配方变更影响预演（内存计算，不写库）
+- POST /batches/{batch_id}/portion-diagnosis 配方份数误差诊断（内存计算，不写库）
 """
 from __future__ import annotations
 
@@ -32,6 +33,10 @@ from .schemas import (
     PoolPlanOut,
     PoolPlanRecipeItemOut,
     PoolPlanRequest,
+    PortionDiagnosisOut,
+    PortionDiagnosisRequest,
+    PortionDiagnosisSolutionOut,
+    PortionDiagnosisUndeterminableOut,
     PreviewComponentOut,
     RecipeItemOut,
     RecipePreviewOut,
@@ -42,6 +47,7 @@ from .service import (
     PoolPlanError,
     batch_composition,
     pool_plan,
+    portion_diagnosis,
     reachable_samples,
     recipe_preview,
 )
@@ -528,4 +534,85 @@ def preview_recipe(
             for i in ids
         ],
         affected_batches=batches_out,
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/portion-diagnosis",
+    response_model=PortionDiagnosisOut,
+    summary="配方份数误差诊断（不修改数据库）",
+)
+def diagnose_portions(
+    batch_id: int,
+    payload: PortionDiagnosisRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PortionDiagnosisOut:
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"批次不存在: {batch_id}")
+    if row["kind"] != "pool":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"原始样本没有配方可诊断: {batch_id}",
+        )
+
+    # 实测占比引用的批次必须已存在且为原始样本（与禁配规则登记同款校验）
+    # （measurements 非空：占比之和必须为 1 的校验已先行通过）
+    sample_ids = sorted({item.sample_id for item in payload.measurements})
+    placeholders = ", ".join("?" for _ in sample_ids)
+    rows = {
+        r["id"]: r
+        for r in conn.execute(
+            f"SELECT id, kind FROM batches WHERE id IN ({placeholders})", sample_ids
+        )
+    }
+    missing = [i for i in sample_ids if i not in rows]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+    not_samples = [i for i in sample_ids if rows[i]["kind"] != "sample"]
+    if not_samples:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"实测对象必须是原始样本（kind='sample'）: {not_samples}",
+        )
+
+    measured = {
+        item.sample_id: Fraction(item.numerator, item.denominator)
+        for item in payload.measurements
+    }
+    solutions, undeterminable = portion_diagnosis(
+        conn, batch_id, measured, payload.max_portions
+    )
+
+    # 一次性解析出现在结果中的原料批次名称
+    result_ids = [i for i, _ in solutions] + list(undeterminable)
+    names = (
+        {
+            r["id"]: r["name"]
+            for r in conn.execute(
+                "SELECT id, name FROM batches WHERE id IN (%s)"
+                % ", ".join("?" for _ in result_ids),
+                result_ids,
+            )
+        }
+        if result_ids
+        else {}
+    )
+    return PortionDiagnosisOut(
+        batch_id=row["id"],
+        batch_name=row["name"],
+        solutions=[
+            PortionDiagnosisSolutionOut(
+                batch_id=ingredient_id,
+                batch_name=names[ingredient_id],
+                portions=portions,
+            )
+            for ingredient_id, portions in solutions
+        ],
+        undeterminable=[
+            PortionDiagnosisUndeterminableOut(
+                batch_id=ingredient_id, batch_name=names[ingredient_id]
+            )
+            for ingredient_id in undeterminable
+        ],
     )
